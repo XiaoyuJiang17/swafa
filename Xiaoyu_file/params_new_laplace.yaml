@@ -1,0 +1,126 @@
+online_fa:
+  gradient_optimiser: 'sgd'
+  gradient_optimiser_kwargs:
+    lr: 0.001
+  gradient_warm_up_time_steps: 100
+  em_warm_up_time_steps: 100
+  experiments:
+    - {observation_dim: 100, latent_dim: 10, spectrum_range: [1, 10], n_samples: [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]}
+    - {observation_dim: 100, latent_dim: 10, spectrum_range: [1, 100], n_samples: [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]}
+    - {observation_dim: 100, latent_dim: 10, spectrum_range: [1, 1000], n_samples: [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]}
+    - {observation_dim: 100, latent_dim: 10, spectrum_range: [1, 10000], n_samples: [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]}
+    - {observation_dim: 1000, latent_dim: 10, spectrum_range: [1, 10], n_samples: [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]}
+    - {observation_dim: 1000, latent_dim: 10, spectrum_range: [1, 100], n_samples: [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]}
+    - {observation_dim: 1000, latent_dim: 10, spectrum_range: [1, 1000], n_samples: [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]}
+    - {observation_dim: 1000, latent_dim: 10, spectrum_range: [1, 10000], n_samples: [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]}
+  n_trials: 10
+
+online_fa_analysis:
+  min_samples: 100
+
+linear_regression_vi:
+  testing: true
+  datasets:
+    boston_housing:
+      latent_dim: 3
+      n_gradients_per_update: 10
+      optimiser: 'sgd'
+      bias_optimiser_kwargs:
+        lr: 0.001
+      factors_optimiser_kwargs:
+        lr: 0.001
+      noise_optimiser_kwargs:
+        lr: 0.001
+      max_grad_norm: 10
+      batch_size: 100
+      n_epochs: 25000
+    yacht_hydrodynamics:
+      latent_dim: 3
+      n_gradients_per_update: 10
+      optimiser: 'sgd'
+      bias_optimiser_kwargs:
+        lr: 0.01
+      factors_optimiser_kwargs:
+        lr: 0.01
+      noise_optimiser_kwargs:
+        lr: 0.01
+      max_grad_norm: 10
+      batch_size: 100
+      n_epochs: 45000
+    concrete_strength:
+      latent_dim: 3
+      n_gradients_per_update: 10
+      optimiser: 'sgd'
+      bias_optimiser_kwargs:
+        lr: 0.01
+      factors_optimiser_kwargs:
+        lr: 0.01
+      noise_optimiser_kwargs:
+        lr: 0.01
+      max_grad_norm: 10
+      batch_size: 100
+      n_epochs: 20000
+    energy_efficiency:
+      latent_dim: 3
+      n_gradients_per_update: 10
+      optimiser: 'sgd'
+      bias_optimiser_kwargs:
+        lr: 0.01
+      factors_optimiser_kwargs:
+        lr: 0.01
+      noise_optimiser_kwargs:
+        lr: 0.01
+      max_grad_norm: 10
+      batch_size: 100
+      n_epochs: 25000
+
+neural_net_predictions:
+  n_cv_folds: 5 # same as https://arxiv.org/pdf/1811.04504.pdf
+  n_hyperparameter_trials: 30 # same as https://arxiv.org/pdf/1811.04504.pdf
+  hidden_dims: [50,50] # new! last version is [50,25]
+  hidden_activation_fn: 'relu' # same as https://arxiv.org/pdf/1811.04504.pdf
+  data_split_random_seed: 1 # same as https://github.com/yaringal/DropoutUncertaintyExps/tree/master/UCI_Datasets
+  test: true
+  n_train_test_splits: 20 # same as https://arxiv.org/pdf/1811.04504.pdf
+  train_fraction: 0.9  # same as https://arxiv.org/pdf/1811.04504.pdf
+  datasets: # same as https://github.com/aaronpmishkin/SLANG/tree/master/code/python/libs/vi_lib/experiments/uci
+    boston_housing:
+      latent_dim: 1
+      n_gradients_per_update: 4
+      max_grad_norm: 10
+      batch_size: 10
+      n_epochs: 120
+      learning_rate_range: [0.01, 0.02]
+      prior_alpha_range: [0.141, 4.472] # [0.01, 10]
+      noise_precision_range: [0.01, 1]
+      n_bma_samples: 100
+    yacht_hydrodynamics:
+      latent_dim: 1
+      n_gradients_per_update: 4
+      max_grad_norm: 10
+      batch_size: 10
+      n_epochs: 120
+      learning_rate_range: [0.01, 0.02]
+      prior_alpha_range: [0.141, 4.472] # [0.01, 10]
+      noise_precision_range: [0.01, 1]
+      n_bma_samples: 100
+    concrete_strength:
+      latent_dim: 1
+      n_gradients_per_update: 4
+      max_grad_norm: 10
+      batch_size: 10
+      n_epochs: 120
+      learning_rate_range: [0.01, 0.02]
+      prior_alpha_range: [0.141, 4.472] # [0.01, 10]
+      noise_precision_range: [0.01, 1]
+      n_bma_samples: 100
+    energy_efficiency:
+      latent_dim: 1
+      n_gradients_per_update: 4
+      max_grad_norm: 10
+      batch_size: 10
+      n_epochs: 120
+      learning_rate_range: [0.01, 0.02]
+      prior_alpha_range: [0.141, 4.472] # [0.01, 10]
+      noise_precision_range: [0.01, 1]
+      n_bma_samples: 100
