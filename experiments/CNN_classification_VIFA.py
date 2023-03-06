@@ -29,6 +29,8 @@ from torch.autograd import Variable
 
 # Here we modify this callback so that it can use initial model parameter value as the initial value of self.c
 from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.callbacks import LearningRateMonitor
+from torch.optim.lr_scheduler import ExponentialLR
 class FactorAnalysisVariationalInferenceCallback(Callback):
     """
     A callback which can be used with a PyTorch Lightning Trainer to learn the parameters of a factor analysis
@@ -73,7 +75,7 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
             2021.
     """
 
-    def __init__(self, init_c: Tensor, latent_dim: int, precision: float, n_gradients_per_update: int = 1,
+    def __init__(self, init_c: Tensor, scheduler_class, latent_dim: int, precision: float, n_gradients_per_update: int = 1,
                  optimiser_class: Optimizer = SGD, bias_optimiser_kwargs: Optional[dict] = None,
                  factors_optimiser_kwargs: Optional[dict] = None, noise_optimiser_kwargs: Optional[dict] = None,
                  max_grad_norm: Optional[float] = None, device: Optional[torch.device] = None,
@@ -84,6 +86,7 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
         self.precision = precision
         self.n_gradients_per_update = n_gradients_per_update
         self.optimiser_class = optimiser_class
+        self.scheduler_class = scheduler_class
         self.bias_optimiser_kwargs = bias_optimiser_kwargs or dict(lr=1e-3)
         self.factors_optimiser_kwargs = factors_optimiser_kwargs or dict(lr=1e-3)
         self.noise_optimiser_kwargs = noise_optimiser_kwargs or dict(lr=1e-3)
@@ -111,6 +114,7 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
         self._prior_grad_wrt_log_diag_psi = None
 
         self._optimiser = None
+        self._scheduler = None
         self._batch_counter = 0
 
     def on_fit_start(self, trainer: Trainer, pl_module: LightningModule):
@@ -129,6 +133,7 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
             self._init_variational_params()
             self._update_expected_gradients()
             self._init_optimiser()
+            self._init_scheduler()
 
     def on_batch_start(self, trainer: Trainer, pl_module: LightningModule):
         """
@@ -197,6 +202,18 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
                 {'params': [self._log_diag_psi], **self.noise_optimiser_kwargs},
             ],
         )
+    def _init_scheduler(self):
+        """
+        Initialise the scheduler which will controls the learning rate for updating parameters of the variational distribution.
+        """
+        if self.scheduler_class[0] == 'ExponentialLR':
+            self._scheduler = ExponentialLR(self._optimiser, self.scheduler_class[1]) # set last_epoch here
+
+    def on_train_epoch_end(self, lightning_module, outputs: None, a: None):
+        """
+        Schedule learning rate for the next epoch.
+        """
+        self._scheduler.step()
 
     def sample_weight_vector(self) -> Tensor:
         """
@@ -700,36 +717,30 @@ classes = ['airplane', 'automobile', 'bird', 'cat', 'deer',
 
 
 
-
-
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
 # Hyperparameteres
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
 
 
-
-random_seed = 89
-weight_prior_precision = 0.001
+random_seed = 987
+weight_prior_precision = 0.01
 latent_dim = 1
 n_gradients_per_update = 12
 optimiser_class = Adam
-learning_rate = 5e-3
+learning_rate = 1e-4
 bias_optimiser_kwargs = dict(lr=learning_rate)
 factor_optimiser_kwargs = dict(lr=learning_rate)
 noise_optimiser_kwargs = dict(lr=learning_rate)
 
 
 n_samples = (1 - valid_size) * train_data.data.shape[0] # size of train_dataloader
-n_epochs = 300
+n_epochs = 6000
 max_grad_norm = 10 # default = 10
 n_bma_samples = 5
-
 
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
 # Training
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-
-
 
 
 SimpleNet_train = SimpleNet()
@@ -743,10 +754,11 @@ model = ConvolutionalNet(
     random_seed = random_seed,
 )
 
-init_c = vectorise_weights(model).reshape(-1,1) # use the default init values from pytorch
+init_c = vectorise_weights(model).reshape(-1,1).to(device) # use the default init values from pytorch
 
 callbacks = FactorAnalysisVariationalInferenceCallback( # if FixD, use its default fixed dig value; noise_optimiser_kwargs actually not in use
     init_c = init_c,
+    scheduler_class = ['ExponentialLR', 0.95],
     latent_dim = latent_dim,
     precision = weight_prior_precision,
     n_gradients_per_update = n_gradients_per_update,
@@ -760,9 +772,10 @@ callbacks = FactorAnalysisVariationalInferenceCallback( # if FixD, use its defau
 )
 
 tb_logger = pl_loggers.TensorBoardLogger(save_dir = '/home/v1xjian2/BDL/Bayesian_DL/pl_logs/CNN_undertest', name=f'lr:{learning_rate}_precision_{weight_prior_precision}_epoch_{n_epochs}_seed_{random_seed}')
+
 trainer = Trainer(
     max_epochs = n_epochs, 
-    callbacks = callbacks, 
+    callbacks = [callbacks, LearningRateMonitor()], 
     gpus=1 if use_gpu else 0,
     logger=tb_logger
     )
