@@ -1,21 +1,34 @@
+from pyexpat import model
+from random import shuffle
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from copy import deepcopy
 import os
+from tqdm import tqdm
+import time
+import yaml
+import click
 
-import torch.nn as nn
-import torch.nn.functional as F
+import numpy as np
+import pandas as pd
 import torch
 from torch import Tensor, seed
-import numpy as np
-from torchvision import datasets
-import torchvision.transforms as transforms
-from torch.utils.data.sampler import SubsetRandomSampler
-from pytorch_lightning import LightningModule
+import optuna
 from torch.optim import Optimizer, Adam, SGD
-import sys
-sys.path.append('/home/v1xjian2/BDL/Bayesian_DL')
+from torch.autograd import Variable
+import torch.nn as nn
+from torch.utils.data.sampler import SubsetRandomSampler
+import torchvision.transforms as transforms
+from torchvision import datasets
+
+from pytorch_lightning.callbacks import Callback
 from pytorch_lightning import loggers as pl_loggers 
 from pytorch_lightning import Trainer
+from pytorch_lightning import LightningModule
+from pytorch_lightning.callbacks import LearningRateMonitor
+from torch.optim.lr_scheduler import ExponentialLR, LambdaLR
+
+import sys
+sys.path.append('/home/v1xjian2/BDL/Bayesian_DL')
 from swafa.utils import (
     get_callback_epoch_range,
     vectorise_weights,
@@ -25,12 +38,242 @@ from swafa.utils import (
     normalise_gradient,
 )
 from swafa.fa import OnlineGradientFactorAnalysis
-from torch.autograd import Variable
 
-# Here we modify this callback so that it can use initial model parameter value as the initial value of self.c
-from pytorch_lightning.callbacks import Callback
-from pytorch_lightning.callbacks import LearningRateMonitor
-from torch.optim.lr_scheduler import ExponentialLR
+
+# Method in 'Benchmarking Bayesian Deep Learning on Biabetic Retinopathy Detection Tasks' 2022.
+def predictive_distributions_entropy(dist: torch.tensor, base = 'log2', eps = 1e-4):
+    """
+    Args:
+        dist: list of predictive distributions which need calculating the entropy, of shape (n_test_samples, n_classes)
+
+    Returns:
+        entropies for each test point, of shape (n_test_samples, )
+
+    """
+    # for numerical stability, replace 0 by a small number
+    dist[dist == 0] = eps
+    if base == 'log2':
+        return -torch.sum(dist * torch.log2(dist), dim = -1)
+
+
+# Method in 'On Stein Variational Neural Network Ensembles' 2021
+def model_disagreement_score(dists: torch.tensor):
+
+    """
+    Args:
+        dists: List of predictive distributions (from different samples of variational distribution)
+        of shape(n_test_samples, n_bma_samples, n_classes)
+
+    Returns:
+        model disagreement score for the test inputs (n_test_samples, )
+    """
+    mean_dist = torch.mean(dists, axis=1) # (n_test_samples, n_classes)
+    mean_dist = mean_dist.unsqueeze(dim=1).repeat(1, dists.shape[1], 1)
+    scores = (dists - mean_dist)**2
+    return torch.mean(scores, axis = [1,2])
+
+
+class ConvolutionalNet(LightningModule):
+
+    """
+    A simple convolutional neural network with a classification output.
+
+    Implements functionality which allows it to be used with a PyTorch Lightning Trainer.
+
+    Args:
+        net: The CNN network architecture.
+        optimiser_class: The class of the PyTorch optimiser to use for training the neural network.
+        optimiser_kwargs: Keyword arguments for the optimiser class.
+        loss_fn: The PyTorch loss function to use for training the model. Will be applied to the un-activated outputs
+            of the neural network.
+        loss_multiplier: A constant with which to multiply the loss of each batch. Useful if an estimate of the total
+            loss over the full dataset is needed.
+        random_seed: The random seed for initialising the weights of the neural network. If None, won't be reproducible.
+
+    """
+
+    def __init__(self, Net: nn.Module, optimiser_class: Optimizer = Adam, optimiser_kwargs: Optional[dict] = None,
+                 loss_fn: nn.Module = nn.CrossEntropyLoss(), loss_multiplier: float = 1.0, random_seed: Optional[int] = None):
+        super().__init__()
+        if random_seed is not None:
+            torch.manual_seed(random_seed)
+
+        self.net = Net
+        self.optimiser_class = optimiser_class
+        self.optimiser_kwargs = optimiser_kwargs or dict(lr=1e-3)
+        self.loss_fn = loss_fn
+        self.loss_multiplier = loss_multiplier
+
+        
+    @staticmethod
+    def _identity_fn(X: Tensor) -> Tensor:
+        """
+        An function which returns the input unchanged.
+
+        Args:
+            X: A Tensor of any shape.
+
+        Returns:
+            Exactly the same as the unput.
+        """
+        return X
+
+    def forward(self, X: Tensor) -> Tensor:
+        """
+        Run the forward pass of the neural network.
+
+        Args:
+            X: Input features. Of shape (n_samples, n_features).
+
+        Returns:
+            Neural network outputs. Of shape (n_samples,).
+        """
+        return self.net(X)
+
+    def configure_optimizers(self) -> Optimizer:
+        """
+        Initialise the optimiser which will be used to train the neural network.
+
+        Returns:
+            The initialised optimiser
+        """
+        return self.optimiser_class(self.net.parameters(), **self.optimiser_kwargs)
+
+    def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
+        """
+        Compute the training loss for a single batch of data.
+
+        Args:
+            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
+                (batch_size,).
+            batch_idx: The index of the batch relative to the current epoch.
+
+        Returns:
+            The batch training loss. Of shape (1,).
+        """
+        loss, correct_rate = self._step(batch, batch_idx)
+        self.log('train/loss', loss, prog_bar=True, logger=True)
+        self.log('train/acc', correct_rate, prog_bar=True, logger=True)
+        return loss
+
+    def validation_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
+        """
+        Compute the validation loss for a single batch of data.
+
+        Args:
+            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
+                (batch_size,).
+            batch_idx: The index of the batch relative to the current epoch.
+
+        Returns:
+            The batch validation loss. Of shape (1,).
+        """
+        loss, correct_rate = self._step(batch, batch_idx)
+        self.log('valid/loss', loss, prog_bar=True, logger=True)
+        self.log('valid/acc', correct_rate, prog_bar=True, logger=True)
+        return loss
+
+    def test_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
+        """
+        Compute the test loss for a single batch of data.
+
+        Args:
+            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
+                (batch_size,).
+            batch_idx: The index of the batch relative to the current epoch.
+
+        Returns:
+            The batch test loss. Of shape (1,).
+        """
+        loss, correct_rate = self._step(batch, batch_idx)
+        self.log('test/loss', loss, prog_bar=True, logger=True)
+        self.log('test/acc', correct_rate, prog_bar=True, logger=True)
+        return loss
+
+    def _step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
+        """
+        Compute the loss for a single batch of data.
+
+        Args:
+            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
+                (batch_size,).
+            batch_idx: The index of the batch relative to the current epoch.
+
+        Returns:
+            The batch loss. Of shape (1,).
+        """
+        X, y = batch
+        y_hat = self(X)
+        _, pred = torch.max(y_hat, 1)    
+        correct_tensor = pred.eq(y.data.view_as(pred))
+        correct = np.squeeze(correct_tensor.numpy()) if not torch.cuda.is_available() else np.squeeze(correct_tensor.cpu().numpy())
+        correct_rate = np.mean(1.0 * correct)
+        return self.loss_fn(y_hat, y) * self.loss_multiplier, correct_rate
+
+    '''
+    def predict_step(self, batch: Tensor, batch_idx: int, dataloader_idx: Optional[int] = None) -> Tensor:
+        """
+        Predict the outputs for a single batch of data.
+
+        Args:
+            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
+                (batch_size,).
+            batch_idx: The index of the batch relative to the current epoch.
+            dataloader_idx: The index of the dataloader (may be more than one) from which the batch was sampled.
+
+        Returns:
+            The activated outputs. Of shape (batch_size,).
+        """
+        return self(batch[0])
+    '''
+
+    def validation_epoch_end(self, step_losses: List[Tensor]) -> Dict[str, Tensor]:
+        """
+        Compute the average validation loss over all batches.
+
+        Log the loss under the name 'epoch_val_loss'.
+
+        Args:
+            step_losses: The validation loss for each individual batch. Each one of shape (1,).
+
+        Returns:
+            A dict of the form {'epoch_val_loss': loss}, where loss is the average validation loss, of shape (1,).
+        """
+        loss = self._average_loss(step_losses)
+        self.logger.experiment.add_scalar("valid/average loss", loss, self.current_epoch)
+        metrics = dict(epoch_val_loss=loss)
+        self.log_dict(metrics)
+        return metrics
+
+    def test_epoch_end(self, step_losses: List[Tensor]) -> Dict[str, Tensor]:
+        """
+        Compute the average test loss over all batches.
+
+        Log the loss under the name 'epoch_test_loss'.
+
+        Args:
+            step_losses: The test loss for each individual batch. Each one of shape (1,).
+
+        Returns:
+            A dict of the form {'epoch_test_loss': loss}, where loss is the average test loss, of shape (1,).
+        """
+        loss = self._average_loss(step_losses)
+        self.logger.experiment.add_scalar("test/average loss", loss, self.current_epoch)
+
+    @staticmethod
+    def _average_loss(step_losses: List[Tensor]) -> Tensor:
+        """
+        Compute the average of all losses.
+
+        Args:
+            step_losses: Individual losses. Each one of shape (1,).
+
+        Returns:
+            The average loss. Of shape (1,).
+        """
+        return torch.stack(step_losses).mean()
+
+
 class FactorAnalysisVariationalInferenceCallback(Callback):
     """
     A callback which can be used with a PyTorch Lightning Trainer to learn the parameters of a factor analysis
@@ -75,24 +318,25 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
             2021.
     """
 
-    def __init__(self, init_c: Tensor, scheduler_class, latent_dim: int, precision: float, n_gradients_per_update: int = 1,
+    def __init__(self, init_c: Tensor, latent_dim: int, precision: float, n_gradients_per_update: int = 1,
                  optimiser_class: Optimizer = SGD, bias_optimiser_kwargs: Optional[dict] = None,
                  factors_optimiser_kwargs: Optional[dict] = None, noise_optimiser_kwargs: Optional[dict] = None,
                  max_grad_norm: Optional[float] = None, device: Optional[torch.device] = None,
-                 random_seed: Optional[int] = None):
+                 random_seed: Optional[int] = None, epochs_at_stage_1: int = 35, increase_resistance: int = 20):
                  
         self.init_c = init_c
         self.latent_dim = latent_dim
         self.precision = precision
         self.n_gradients_per_update = n_gradients_per_update
         self.optimiser_class = optimiser_class
-        self.scheduler_class = scheduler_class
         self.bias_optimiser_kwargs = bias_optimiser_kwargs or dict(lr=1e-3)
         self.factors_optimiser_kwargs = factors_optimiser_kwargs or dict(lr=1e-3)
         self.noise_optimiser_kwargs = noise_optimiser_kwargs or dict(lr=1e-3)
         self.max_grad_norm = max_grad_norm
         self.device = device
         self.random_seed = random_seed
+        self.epochs_at_stage_1 = epochs_at_stage_1
+        self.increase_resistance = increase_resistance # The smaller, the quicker
 
         self.weight_dim = None
         self.c = None
@@ -116,6 +360,7 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
         self._optimiser = None
         self._scheduler = None
         self._batch_counter = 0
+        self._epoch_counter = 0
 
     def on_fit_start(self, trainer: Trainer, pl_module: LightningModule):
         """
@@ -132,8 +377,8 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
             self.weight_dim = get_weight_dimension(pl_module)
             self._init_variational_params()
             self._update_expected_gradients()
-            self._init_optimiser()
-            self._init_scheduler()
+            self._init_optimisers()
+            self._init_schedulers()        
 
     def on_batch_start(self, trainer: Trainer, pl_module: LightningModule):
         """
@@ -183,37 +428,43 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
         
         #self.c = Variable(fa.c.data, requires_grad=False)
         self.c = Variable(self.init_c, requires_grad=False)  # we will compute our own gradients
-        self.F = Variable(fa.F.data, requires_grad=False)
-        self.diag_psi = fa.diag_psi
+        self.F = Variable(fa.F.data * 0.00001, requires_grad=False)
+        self.diag_psi = fa.diag_psi * 0.00001
         self._log_diag_psi = Variable(torch.log(self.diag_psi), requires_grad=False)
 
         self.c.grad = torch.zeros_like(self.c.data, device=self.device)
         self.F.grad = torch.zeros_like(self.F.data, device=self.device)
         self._log_diag_psi.grad = torch.zeros_like(self._log_diag_psi.data, device=self.device)
 
-    def _init_optimiser(self):
+    def _init_optimisers(self):
         """
         Initialise the optimiser which will be used to update the parameters of the variational distribution.
         """
-        self._optimiser = self.optimiser_class(
-            [
-                {'params': [self.c], **self.bias_optimiser_kwargs},
-                {'params': [self.F], **self.factors_optimiser_kwargs},
-                {'params': [self._log_diag_psi], **self.noise_optimiser_kwargs},
-            ],
-        )
-    def _init_scheduler(self):
+        self._optimiser_c = self.optimiser_class([self.c], **self.bias_optimiser_kwargs)
+        self._optimiser_F = self.optimiser_class([self.F], **self.factors_optimiser_kwargs)
+        self._optimiser_log_diag_psi = self.optimiser_class([self._log_diag_psi], **self.noise_optimiser_kwargs)
+
+    def _init_schedulers(self):
         """
-        Initialise the scheduler which will controls the learning rate for updating parameters of the variational distribution.
+        Initialise the schedulers which will control the learning rate for updating parameters of the variational distribution.
         """
-        if self.scheduler_class[0] == 'ExponentialLR':
-            self._scheduler = ExponentialLR(self._optimiser, self.scheduler_class[1]) # set last_epoch here
+        self._scheduler_c = ExponentialLR(self._optimiser_c, 0.95)
+        
+        m = torch.nn.Sigmoid()
+        lr_lambda_factors = lambda epoch: 0.0 if epoch < self.epochs_at_stage_1 else self.factors_optimiser_kwargs['lr'] * float(m( torch.tensor((epoch - self.increase_resistance)) ) )
+        lr_lambda_noise = lambda epoch: 0.0 if epoch < self.epochs_at_stage_1 else self.noise_optimiser_kwargs['lr'] * float(m( torch.tensor((epoch - self.increase_resistance)) ) )
+        
+        self._scheduler_F = LambdaLR(self._optimiser_F, lr_lambda_factors)
+        self._scheduler_log_diag_psi = LambdaLR(self._optimiser_log_diag_psi, lr_lambda_noise)
 
     def on_train_epoch_end(self, lightning_module, outputs: None, a: None):
         """
         Schedule learning rate for the next epoch.
         """
-        self._scheduler.step()
+        self._scheduler_c.step()
+        self._scheduler_F.step()
+        self._scheduler_log_diag_psi.step()
+        self._epoch_counter += 1
 
     def sample_weight_vector(self) -> Tensor:
         """
@@ -238,8 +489,9 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
                 (self.weight_dim, 1).
         """
         self.c.grad += self._compute_gradient_wrt_c(grad_weights)
-        self.F.grad += self._compute_gradient_wrt_F(grad_weights)
-        self._log_diag_psi.grad += self._compute_gradient_wrt_log_diag_psi(grad_weights)
+        if self._epoch_counter >= self.epochs_at_stage_1:
+            self.F.grad += self._compute_gradient_wrt_F(grad_weights)
+            self._log_diag_psi.grad += self._compute_gradient_wrt_log_diag_psi(grad_weights)
 
     def _compute_gradient_wrt_c(self, grad_weights: Tensor) -> Tensor:
         """
@@ -327,13 +579,18 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
         After performing the updates, the gradients are reset to zero.
         """
         self._average_and_normalise_gradient(self.c)
-        self._average_and_normalise_gradient(self.F)
-        self._average_and_normalise_gradient(self._log_diag_psi)
+        self._optimiser_c.step()
+        self._optimiser_c.zero_grad()
 
-        self._optimiser.step()
-        self._optimiser.zero_grad()
+        if self._epoch_counter >= self.epochs_at_stage_1:
+            self._average_and_normalise_gradient(self.F)
+            self._optimiser_F.step()
+            self._optimiser_F.zero_grad()
 
-        self.diag_psi = torch.exp(self._log_diag_psi)
+            self._average_and_normalise_gradient(self._log_diag_psi)
+            self._optimiser_log_diag_psi.step()
+            self._optimiser_log_diag_psi.zero_grad()
+            self.diag_psi = torch.exp(self._log_diag_psi)
 
     def _average_and_normalise_gradient(self, var: Variable):
         """
@@ -352,14 +609,15 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
         """
         Update the expected gradients used in the algorithm which do not depend on the sampled network weights.
         """
-        self._update_A()
-        self._update_B()
-        self._update_C()
-        self._update_variational_gradient_wrt_F()
-        self._update_variational_gradient_wrt_log_diag_psi()
         self._update_prior_gradient_wrt_c()
-        self._update_prior_gradient_wrt_F()
-        self._update_prior_gradient_wrt_log_diag_psi()
+        if self._epoch_counter >= self.epochs_at_stage_1 or self._epoch_counter == 0:
+            self._update_A()
+            self._update_B()
+            self._update_C()
+            self._update_variational_gradient_wrt_F()
+            self._update_variational_gradient_wrt_log_diag_psi()
+            self._update_prior_gradient_wrt_F()
+            self._update_prior_gradient_wrt_log_diag_psi()
 
     def _update_A(self):
         """
@@ -433,424 +691,495 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
         psi = torch.diag(self.diag_psi.squeeze())
         return self.F.mm(self.F.t()) + psi
 
-use_gpu = torch.cuda.is_available()
-device = torch.device("cuda:0" if use_gpu else "cpu")
 
-class SimpleNet(nn.Module):
-  def __init__(self):
-    super(SimpleNet, self).__init__()
-    self.conv1 = nn.Conv2d(3, 6, 5)
-    self.pool = nn.MaxPool2d(2, 2)
-    self.conv2 = nn.Conv2d(6, 16, 5)
-    self.fc1 = nn.Linear(16 * 5 * 5, 120)
-    self.fc2 = nn.Linear(120, 84)
-    self.fc3 = nn.Linear(84, 10)
-  def forward(self, x):
-    x = self.pool(F.relu(self.conv1(x)))
-    x = self.pool(F.relu(self.conv2(x)))
-    x = x.view(-1, 16 * 5 * 5)
-    x = F.relu(self.fc1(x))
-    x = F.relu(self.fc2(x))
-    x = self.fc3(x)
-    return x
-
-
-class ConvolutionalNet(LightningModule):
-
+class Objective:
     """
-    A simple convolutional neural network with a classification output.
-
-    Implements functionality which allows it to be used with a PyTorch Lightning Trainer.
-
-    Args:
-        net: The CNN network architecture.
-        optimiser_class: The class of the PyTorch optimiser to use for training the neural network.
-        optimiser_kwargs: Keyword arguments for the optimiser class.
-        loss_fn: The PyTorch loss function to use for training the model. Will be applied to the un-activated outputs
-            of the neural network.
-        loss_multiplier: A constant with which to multiply the loss of each batch. Useful if an estimate of the total
-            loss over the full dataset is needed.
-        random_seed: The random seed for initialising the weights of the neural network. If None, won't be reproducible.
-
+    An objective function which can be used in an Optuna study to optimise the hyperparameters of the resnet model
     """
 
-    def __init__(self, Net: nn.Module, optimiser_class: Optimizer = Adam, optimiser_kwargs: Optional[dict] = None,
-                 loss_fn: nn.Module = nn.MSELoss(), loss_multiplier: float = 1.0, random_seed: Optional[int] = None):
-        super().__init__()
-        if random_seed is not None:
-            torch.manual_seed(random_seed)
+    def __init__(
+        self,
+        train_valid_dataset,
+        test_dataset,
+        train_idx,
+        valid_idx,
+        latent_dim: int,
+        n_gradients_per_update: int,
+        max_grad_norm: float,
+        batch_size: int,
+        n_epochs: int,
+        learning_rate_range: List[float],
+        prior_precision_range: List[float],
+        n_bma_samples: int,
+        random_seed: Optional[int] = None,
+        device = "cuda:0",
+        epochs_at_stage_1 = 3,
+        increase_resistance = 10,
+        log_dir = '/home/v1xjian2/BDL/Bayesian_DL/pl_logs/CNN_undertest',
+        threshold = 6000 # 10,000 test samples in total,
+    ):
+        """
+        Args:
+            epochs_at_stage_1: the number of epochs during which we only train bias parameter c in variational distribution.
+            increase_resistance: the bias term in sigma used for coefficient computation, ceof = sigma(epoch - increase_resistance).
+            log_dir: the path to store log files generated by tensorboard.
+            threshold: the number of machine-made predictions with top uncertainty.
+        """
+        self._train_valid_dataset = train_valid_dataset
+        self._test_dataset = test_dataset
+        self.train_idx = train_idx
+        self.valid_idx = valid_idx
+        self.latent_dim = latent_dim
+        self.n_gradients_per_update = n_gradients_per_update
+        self.max_grad_norm = max_grad_norm
+        self.batch_size = batch_size
+        self.n_epochs = n_epochs
+        self.learning_rate_range = learning_rate_range
+        self.prior_precision_range = prior_precision_range
+        self.n_bma_samples = n_bma_samples
+        self.random_seed = random_seed
+        self.device = device
+        self.epochs_at_stage_1 = epochs_at_stage_1
+        self.increase_resistance = increase_resistance
+        self.log_dir = log_dir
+        self.threshold = threshold
 
-        self.net = Net
-        self.optimiser_class = optimiser_class
-        self.optimiser_kwargs = optimiser_kwargs or dict(lr=1e-3)
-        self.loss_fn = loss_fn
-        self.loss_multiplier = loss_multiplier
+        self.train_loader = torch.utils.data.DataLoader(self._train_valid_dataset, batch_size=self.batch_size, sampler=SubsetRandomSampler(self.train_idx))
+        self.val_loader = torch.utils.data.DataLoader(self._train_valid_dataset, batch_size=self.batch_size, sampler=SubsetRandomSampler(self.valid_idx))
+        self.test_loader = torch.utils.data.DataLoader(self._test_dataset, batch_size=self.batch_size)
 
+        self.use_gpu = not self.device=="cpu"
+    
+    def __call__(self, trial: optuna.Trial):
+        """
+        Sample hyperparameters and run train_and_test.
+        Args:
+            trial: An optuna trial from which to sample hyperparameters.
+        Returns:
+            Validation accuracy. Higher is better (maximisation).
+        """
+        learning_rate   = trial.suggest_loguniform('learning_rate',   *self.learning_rate_range)
+        prior_precision = trial.suggest_loguniform('prior_precision', *self.prior_precision_range)
+
+        acc, _ , _ = self.train_and_test(learning_rate, prior_precision) # here we only run on valid_set, no test_set needed
+
+        return acc
+    
+    def train_and_test(self, learning_rate, prior_precision, test:bool = False):
+        """
+        Args:
+            learning_rate: learning rate used for training.
+            prior_precision: prior_precision used in training. 
+            test: If false, test on the validation set; if true, test on the test set. 
         
-    @staticmethod
-    def _identity_fn(X: Tensor) -> Tensor:
+        Return:
+            Metrices from test function.
         """
-        An function which returns the input unchanged.
+        model, callbacks = self.train(learning_rate, prior_precision)
 
+        if test == False:
+            val_acc, val_loss, val_metric_dirct = self.test(model, callbacks, self.val_loader)
+            return val_acc, val_loss, val_metric_dirct
+
+        elif test == True:
+            test_acc, test_loss, test_metric_dirct = self.test(model, callbacks, self.test_loader)
+            return test_acc, test_loss, test_metric_dirct
+        
+
+    def train(self, learning_rate, prior_precision):
+
+        """
         Args:
-            X: A Tensor of any shape.
+            learning_rate: learning rate used for training.
+            prior_precision: prior_precision used in training.    
 
-        Returns:
-            Exactly the same as the unput.
+        Return:
+            Model and Callback after training.
         """
-        return X
 
-    def forward(self, X: Tensor) -> Tensor:
+        resnet_model = torch.hub.load('pytorch/vision:v0.10.0', 'resnet18', pretrained=True)
+
+        num_ftrs = resnet_model.fc.in_features
+        resnet_model.fc = nn.Sequential(
+            nn.Linear(num_ftrs, 10),
+        )
+
+        use_gpu = self.use_gpu
+
+        model = ConvolutionalNet(
+            Net = resnet_model,
+            optimiser_class = Adam,
+            optimiser_kwargs = dict(lr=learning_rate),
+            loss_fn = nn.CrossEntropyLoss(),
+            loss_multiplier = len(self.train_idx), # ?
+            random_seed = self.random_seed,
+        )
+
+        init_c = vectorise_weights(model).reshape(-1,1).to(self.device) # use the default init values from pytorch
+
+        callbacks = FactorAnalysisVariationalInferenceCallback(
+            init_c = init_c,
+            latent_dim = self.latent_dim,
+            precision = prior_precision,
+            n_gradients_per_update = self.n_gradients_per_update,
+            optimiser_class = Adam,
+            bias_optimiser_kwargs = dict(lr=learning_rate),
+            factors_optimiser_kwargs = dict(lr=learning_rate),
+            noise_optimiser_kwargs = dict(lr=learning_rate),
+            max_grad_norm = self.max_grad_norm,
+            random_seed = self.random_seed,
+            device = self.device,
+            epochs_at_stage_1 = self.epochs_at_stage_1,
+            increase_resistance = self.increase_resistance, 
+        )
+
+        tb_logger = pl_loggers.TensorBoardLogger(save_dir = self.log_dir, name=f'lr:{learning_rate}_precision_{prior_precision}_epoch_{self.n_epochs}_seed_{self.random_seed}')
+
+        trainer = Trainer(
+            max_epochs = self.n_epochs, 
+            callbacks = [callbacks, LearningRateMonitor()], 
+            gpus=1 if self.use_gpu else 0,
+            logger=tb_logger,
+        )
+
+        trainer.fit(model, self.train_loader, self.val_loader)
+
+        return model, callbacks
+
+
+    def test(self, model, callbacks, test_loader):
         """
-        Run the forward pass of the neural network.
-
         Args:
-            X: Input features. Of shape (n_samples, n_features).
+            model: the trained model, is an instance of class ConvolutionalNet.
+            callbacks: the trained callback, is an instance of class FactorAnalysisVariationalInferenceCallback.
+            test_loader: the dataloader which we would like to evaluate, has two choices, dataloader for valid set or test set. 
 
         Returns:
-            Neural network outputs. Of shape (n_samples,).
+            evaliation metrices, acc (float), loss (float) and a metric dictionary.
         """
-        return self.net(X)
 
-    def configure_optimizers(self) -> Optimizer:
-        """
-        Initialise the optimiser which will be used to train the neural network.
+        mm = torch.nn.Softmax(dim=1)
+        pred_entropy_list = []
+        model_disag_score_list = []
+        pred_list = []
+        target_list = []
 
-        Returns:
-            The initialised optimiser
-        """
-        return self.optimiser_class(self.net.parameters(), **self.optimiser_kwargs)
+        # track test loss
+        test_loss = 0.0
+        class_correct = list(0. for i in range(10))
+        class_total = list(0. for i in range(10))
 
-    def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
-        """
-        Compute the training loss for a single batch of data.
+        model.eval()
+        with torch.no_grad():
+            # iterate over test data
+            for data, target in tqdm(test_loader):
+                # move tensors to GPU if CUDA is available
+                if self.use_gpu:
+                    data, target = data.cuda(), target.cuda()
 
-        Args:
-            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
-                (batch_size,).
-            batch_idx: The index of the batch relative to the current epoch.
+                # get posterior predictive mean for predicting
+                target_list.extend(target.float().tolist())
+                output_softmax = torch.zeros(data.size(0), 10).to(self.device)
+                output_softmax_store = torch.tensor([]).to(self.device)
 
-        Returns:
-            The batch training loss. Of shape (1,).
-        """
-        loss, correct_rate = self._step(batch, batch_idx)
-        self.log('train/loss', loss, prog_bar=True, logger=True)
-        self.log('train/correctness_rate', correct_rate, prog_bar=True, logger=True)
-        return loss
+                for i in range(self.n_bma_samples):
 
-    def validation_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
-        """
-        Compute the validation loss for a single batch of data.
+                    curr_weights = callbacks.sample_weight_vector()
+                    set_weights(model, torch.tensor(curr_weights).reshape(-1))
+                    model.to(self.device)
+                    # forward pass: compute predicted outputs by passing inputs to the model
+                    curr_output = model(data)
+                    curr_output_softmax = mm(curr_output) # (data.size(0),10)
+                    output_softmax += curr_output_softmax
+                    output_softmax_store = torch.cat( (curr_output_softmax.reshape(data.size(0),1,10), output_softmax_store), dim = 1 ) # finally (data.size(0), 5, 10)
 
-        Args:
-            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
-                (batch_size,).
-            batch_idx: The index of the batch relative to the current epoch.
+                output_softmax = output_softmax / self.n_bma_samples # (data.size(0),10)
+                # Uncertainty measurement
+                pred_entropy_list += (predictive_distributions_entropy(output_softmax)).tolist()
+                model_disag_score_list += (model_disagreement_score(output_softmax_store)).tolist()
 
-        Returns:
-            The batch validation loss. Of shape (1,).
-        """
-        loss, correct_rate = self._step(batch, batch_idx)
-        self.log('valid/loss', loss, prog_bar=True, logger=True)
-        self.log('valid/correctness_rate', correct_rate, prog_bar=True, logger=True)
-        return loss
+                # calculate the batch loss
+                loss = -sum([torch.log2(output_softmax)[i][target[i]] for i in range(data.size(0))]) # cross entropy value
+                # update test loss 
+                test_loss += loss.data
+                # convert output probabilities to predicted class
+                _, pred = torch.max(output_softmax, 1)  
+                pred_list += pred.tolist()
+                # compare predictions to true label
+                correct_tensor = pred.eq(target.data.view_as(pred))
+                correct = np.squeeze(correct_tensor.numpy()) if not self.use_gpu else np.squeeze(correct_tensor.cpu().numpy())
+                #print(correct)
+                # calculate test accuracy for each object class
+                for i in range(len(correct)):
+                    label = target.data[i]
+                    class_correct[label] += correct[i].item()
+                    class_total[label] += 1
 
-    def test_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
-        """
-        Compute the test loss for a single batch of data.
+        # average test loss
+        test_loss = test_loss/len(test_loader.dataset)
+        val_acc = 100. * np.sum(class_correct) / np.sum(class_total)
 
-        Args:
-            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
-                (batch_size,).
-            batch_idx: The index of the batch relative to the current epoch.
+        # prediction with uncertainty
+        assert len(pred_list)==len(pred_entropy_list)==len(model_disag_score_list)==len(target_list)
 
-        Returns:
-            The batch test loss. Of shape (1,).
-        """
-        loss, correct_rate = self._step(batch, batch_idx)
-        self.log('test/loss', loss, prog_bar=True, logger=True)
-        self.log('test/correctness_rate', correct_rate, prog_bar=True, logger=True)
-        return loss
+        # indices
+        pred_entropy_sorted_indices = [pred_entropy_list.index(x) for x in sorted(pred_entropy_list)]
+        model_disag_score_indices = [model_disag_score_list.index(x) for x in sorted(model_disag_score_list)]
 
-    def _step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
-        """
-        Compute the loss for a single batch of data.
+        entropy_guided_acc = sum([pred_list[i] == target_list[i] for i in pred_entropy_sorted_indices[:self.threshold]])/self.threshold
+        disag_score_guided_acc = sum([pred_list[i] == target_list[i] for i in model_disag_score_indices[:self.threshold]])/self.threshold
 
-        Args:
-            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
-                (batch_size,).
-            batch_idx: The index of the batch relative to the current epoch.
+        metric_dirct = {}
+        metric_dirct['entropy_guided_acc'] = round(entropy_guided_acc, 3)
+        metric_dirct['disag_score_guided_acc'] = round(disag_score_guided_acc,3)
 
-        Returns:
-            The batch loss. Of shape (1,).
-        """
-        X, y = batch
-        y_hat = self(X)
-        _, pred = torch.max(y_hat, 1)    
-        # compare predictions to true label
-        correct_tensor = pred.eq(y.data.view_as(pred))
-        correct = np.squeeze(correct_tensor.numpy()) if not use_gpu else np.squeeze(correct_tensor.cpu().numpy())
-        correct_rate = np.mean(1.0 * correct)
-        # Test whether the loss computation is correct
-        # print('y_hat', y_hat)
-        # print('y', y)
-        # print('self.loss_fn(y_hat, y)', self.loss_fn(y_hat, y))
-        # tmp_loss = 0
-        # for k in range(2):
-        #    tmp_loss += torch.log(torch.sum(torch.exp(y_hat[k]))) - torch.log(torch.exp(y_hat[k][y[k]]))
-        # print('to verify', tmp_loss)
-        # print(stop)
-        return self.loss_fn(y_hat, y) * self.loss_multiplier, correct_rate
-
-    '''
-    def predict_step(self, batch: Tensor, batch_idx: int, dataloader_idx: Optional[int] = None) -> Tensor:
-        """
-        Predict the outputs for a single batch of data.
-
-        Args:
-            batch: (X, y), where X is the input features of shape (batch_size, n_features) and y is the outputs of shape
-                (batch_size,).
-            batch_idx: The index of the batch relative to the current epoch.
-            dataloader_idx: The index of the dataloader (may be more than one) from which the batch was sampled.
-
-        Returns:
-            The activated outputs. Of shape (batch_size,).
-        """
-        return self(batch[0])
-    '''
-
-    def validation_epoch_end(self, step_losses: List[Tensor]) -> Dict[str, Tensor]:
-        """
-        Compute the average validation loss over all batches.
-
-        Log the loss under the name 'epoch_val_loss'.
-
-        Args:
-            step_losses: The validation loss for each individual batch. Each one of shape (1,).
-
-        Returns:
-            A dict of the form {'epoch_val_loss': loss}, where loss is the average validation loss, of shape (1,).
-        """
-        loss = self._average_loss(step_losses)
-        self.logger.experiment.add_scalar("valid/average loss", loss, self.current_epoch)
-        metrics = dict(epoch_val_loss=loss)
-        self.log_dict(metrics)
-        return metrics
-
-    def test_epoch_end(self, step_losses: List[Tensor]) -> Dict[str, Tensor]:
-        """
-        Compute the average test loss over all batches.
-
-        Log the loss under the name 'epoch_test_loss'.
-
-        Args:
-            step_losses: The test loss for each individual batch. Each one of shape (1,).
-
-        Returns:
-            A dict of the form {'epoch_test_loss': loss}, where loss is the average test loss, of shape (1,).
-        """
-        loss = self._average_loss(step_losses)
-        self.logger.experiment.add_scalar("test/average loss", loss, self.current_epoch)
-
-    @staticmethod
-    def _average_loss(step_losses: List[Tensor]) -> Tensor:
-        """
-        Compute the average of all losses.
-
-        Args:
-            step_losses: Individual losses. Each one of shape (1,).
-
-        Returns:
-            The average loss. Of shape (1,).
-        """
-        return torch.stack(step_losses).mean()
+        return round(float(val_acc), 3), round(float(test_loss), 3), metric_dirct
 
 
 
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-# Load data
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
+def run_experiment(
+    train_valid_dataset,  # should be train_data; datasets.CIFAR10(root='/home/v1xjian2/BDL/Bayesian_DL/datasets/cifar-10', train=True, download=False, transform=transform)
+    test_dataset,
+    latent_dim: int,
+    n_gradients_per_update: int,
+    max_grad_norm: float,
+    batch_size: int,
+    n_epochs: int,
+    learning_rate_range: List[float],
+    prior_precision_range: List[float],
+    n_bma_samples: int,
+    test: bool,
+    n_hyperparameter_trials: int = 20,
+    n_train_valid_splits: int = 5,
+    valid_size = 0.2,
+    random_seed: Optional[int] = None,
+    device = "cuda:0",
+    epochs_at_stage_1 = 3,
+    increase_resistance = 10,
+    log_dir = '/home/v1xjian2/BDL/Bayesian_DL/pl_logs/CNN_undertest',
+    threshold = 6000, # 10,000 test samples in total,
+    data_split_random_seed = [26, 93, 101, 2, 8906],
+): 
+    """
+    Args:
+        n_train_valid_splits: the number of train/valid splits.
+        valid_size: the proportion of trian data used for validation. 
+        n_hyperparameter_trials: number of trails for selecting hyperparameter settings (for each train/valid split).
+        learning_rate_range: range for selecting learning rate used for training.
+        prior_precision_range: range for selecting prior_precision used in training. 
+        test: If false, test on the validation set; if true, test on the test set. 
+        epochs_at_stage_1: the number of epochs during which we only train bias parameter c in variational distribution.
+        increase_resistance: the bias term in sigma used for coefficient computation, ceof = sigma(epoch - increase_resistance).
+        log_dir: the path to store log files generated by tensorboard.
+        threshold: the number of machine-made predictions with top uncertainty.
+        data_split_random_seed: a list of random numbers used for train/valid split.
+
+    Returns:
+        results and aggregated results, both stored in pd.DataFrame
+    """
+    num_train = len(train_valid_dataset)
+    indices = list(range(num_train))
+    
+    results = []
+
+    assert len(data_split_random_seed) == n_train_valid_splits
+
+    for i in range(n_train_valid_splits):
+        print(f'\nRunning train/test split {i + 1} of {n_train_valid_splits}...\n')
+        np.random.seed(data_split_random_seed[0])
+        np.random.shuffle(indices)
+        split = int(np.floor(valid_size * num_train))
+        train_idx, valid_idx = indices[split:], indices[:split]
+        start_time = time.time()
+
+        trial_results = run_trial(
+            train_valid_dataset=train_valid_dataset,
+            test_dataset=test_dataset,
+            train_idx=train_idx,
+            valid_idx=valid_idx,
+            latent_dim=latent_dim,
+            n_gradients_per_update=n_gradients_per_update,
+            max_grad_norm=max_grad_norm,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            learning_rate_range=learning_rate_range,
+            prior_precision_range=prior_precision_range,
+            n_bma_samples=n_bma_samples,
+            n_hyperparameter_trials=n_hyperparameter_trials,
+            random_seed=random_seed,
+            device=device,
+            epochs_at_stage_1=epochs_at_stage_1,
+            increase_resistance=increase_resistance,
+            log_dir=log_dir,
+            threshold=threshold,
+            test = test
+        )
+
+        end_time = time.time()
+        trial_results['runtime'] = end_time - start_time
+        results.append(trial_results)
+
+    results = pd.DataFrame(results)
+    agg_results = aggregate_results(results)
+
+    return results, agg_results
 
 
-# number of subprocesses to use for data loading
-num_workers = 0
-# how many samples per batch to load
-batch_size = 32
-# percentage of training set to use as validation
-valid_size = 0.2
+def run_trial(
+    train_valid_dataset,
+    test_dataset,
+    train_idx,
+    valid_idx,
+    latent_dim,
+    n_gradients_per_update,
+    max_grad_norm,
+    batch_size,
+    n_epochs,
+    learning_rate_range,
+    prior_precision_range,
+    n_bma_samples,
+    n_hyperparameter_trials,
+    random_seed,
+    device,
+    epochs_at_stage_1,
+    increase_resistance,
+    log_dir,
+    threshold,
+    test,
+):
+    """
+    Args:
+        train_valid_dataset: contains both train and valid data.
+        test_dataset: dataset for testing.
+        train_idx: pick these indices of samples to form train set.
+        valid_idx: pick these indices of samples to form valid set.
+        learning_rate_range: range for selecting learning rate used for training.
+        prior_precision_range: range for selecting prior_precision used in training. 
+        n_hyperparameter_trials: number of trails for selecting hyperparameter settings (for each train/valid split).
+        epochs_at_stage_1: the number of epochs during which we only train bias parameter c in variational distribution.
+        increase_resistance: the bias term in sigma used for coefficient computation, ceof = sigma(epoch - increase_resistance).
+        log_dir: the path to store log files generated by tensorboard.
+        threshold: the number of machine-made predictions with top uncertainty.
+        test: If false, test on the validation set; if true, test on the test set. 
+    
+    Returns:
+        results stored in a dict.
+    """
 
-# convert data to a normalized torch.FloatTensor
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-
-# choose the training and test datasets
-train_data = datasets.CIFAR10(root='/home/v1xjian2/BDL/Bayesian_DL/datasets/cifar-10', train=True,
-                              download=False, transform=transform)
-test_data = datasets.CIFAR10(root='/home/v1xjian2/BDL/Bayesian_DL/datasets/cifar-10', train=False,
-                             download=False, transform=transform)
-
-# obtain training indices that will be used for validation
-num_train = len(train_data)
-indices = list(range(num_train))
-np.random.shuffle(indices)
-split = int(np.floor(valid_size * num_train))
-train_idx, valid_idx = indices[split:], indices[:split]
-
-# define samplers for obtaining training and validation batches
-train_sampler = SubsetRandomSampler(train_idx)
-valid_sampler = SubsetRandomSampler(valid_idx)
-
-# prepare data loaders (combine dataset and sampler)
-train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size,
-    sampler=train_sampler, num_workers=num_workers) # pin_memory=True
-valid_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, 
-    sampler=valid_sampler, num_workers=num_workers)
-test_loader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, 
-    num_workers=num_workers)
-
-print('data being loaded!')
-# specify the image classes
-classes = ['airplane', 'automobile', 'bird', 'cat', 'deer',
-           'dog', 'frog', 'horse', 'ship', 'truck']   
-
-
-
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-# Hyperparameteres
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-
-
-random_seed = 987
-weight_prior_precision = 0.01
-latent_dim = 1
-n_gradients_per_update = 12
-optimiser_class = Adam
-learning_rate = 1e-4
-bias_optimiser_kwargs = dict(lr=learning_rate)
-factor_optimiser_kwargs = dict(lr=learning_rate)
-noise_optimiser_kwargs = dict(lr=learning_rate)
-
-
-n_samples = (1 - valid_size) * train_data.data.shape[0] # size of train_dataloader
-n_epochs = 6000
-max_grad_norm = 10 # default = 10
-n_bma_samples = 5
-
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-# Training
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-
-
-SimpleNet_train = SimpleNet()
-
-model = ConvolutionalNet(
-    Net = SimpleNet_train,
-    optimiser_class = optimiser_class,
-    optimiser_kwargs = bias_optimiser_kwargs,
-    loss_fn = nn.CrossEntropyLoss(),
-    loss_multiplier = n_samples,
-    random_seed = random_seed,
-)
-
-init_c = vectorise_weights(model).reshape(-1,1).to(device) # use the default init values from pytorch
-
-callbacks = FactorAnalysisVariationalInferenceCallback( # if FixD, use its default fixed dig value; noise_optimiser_kwargs actually not in use
-    init_c = init_c,
-    scheduler_class = ['ExponentialLR', 0.95],
-    latent_dim = latent_dim,
-    precision = weight_prior_precision,
-    n_gradients_per_update = n_gradients_per_update,
-    optimiser_class = optimiser_class,
-    bias_optimiser_kwargs = bias_optimiser_kwargs,
-    factors_optimiser_kwargs = factor_optimiser_kwargs,
-    noise_optimiser_kwargs = noise_optimiser_kwargs,
-    max_grad_norm = max_grad_norm,
-    random_seed = random_seed,
-    device=device,
-)
-
-tb_logger = pl_loggers.TensorBoardLogger(save_dir = '/home/v1xjian2/BDL/Bayesian_DL/pl_logs/CNN_undertest', name=f'lr:{learning_rate}_precision_{weight_prior_precision}_epoch_{n_epochs}_seed_{random_seed}')
-
-trainer = Trainer(
-    max_epochs = n_epochs, 
-    callbacks = [callbacks, LearningRateMonitor()], 
-    gpus=1 if use_gpu else 0,
-    logger=tb_logger
+    objective = Objective(
+        train_valid_dataset=train_valid_dataset,
+        test_dataset=test_dataset,
+        train_idx=train_idx,
+        valid_idx=valid_idx,
+        latent_dim=latent_dim,
+        n_gradients_per_update=n_gradients_per_update,
+        max_grad_norm=max_grad_norm,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        learning_rate_range=learning_rate_range,
+        prior_precision_range=prior_precision_range,
+        n_bma_samples=n_bma_samples,
+        random_seed=random_seed,
+        device=device,
+        epochs_at_stage_1=epochs_at_stage_1,
+        increase_resistance=increase_resistance,
+        log_dir=log_dir,
+        threshold=threshold # 10,000 test samples in total,
     )
 
-callbacks.on_fit_start(trainer = trainer, pl_module = model)
-variational_mean_init = deepcopy(Tensor.cpu(callbacks.c).numpy())
-diag_psi_init = deepcopy(Tensor.cpu(callbacks.diag_psi).numpy())
-F_init = deepcopy(Tensor.cpu(callbacks.F).numpy())
+    sampler = optuna.samplers.RandomSampler(seed=random_seed)
+    study = optuna.create_study(sampler=sampler, direction='maximize')
+    study.optimize(objective, n_trials=n_hyperparameter_trials)
 
-trainer.fit(model, train_loader, valid_loader)
+    learning_rate = study.best_params['learning_rate']
+    prior_precision = study.best_params['prior_precision']
 
-variational_mean_after = deepcopy(Tensor.cpu(callbacks.c).numpy())
-diag_psi_after = deepcopy(Tensor.cpu(callbacks.diag_psi).numpy())
-F_after = deepcopy(Tensor.cpu(callbacks.F).numpy())
+    # Train and evaluate (valid set) with the best hyper-parameter setting, record results. 
+    val_acc, val_loss, val_metric_dirct = objective.train_and_test(learning_rate, prior_precision)
 
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-# Testing
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
+    results = dict(val_acc=val_acc, val_loss=val_loss)
+    results.update(val_metric_dirct)
 
-# Sample a weight vector
-weights1 = callbacks.sample_weight_vector()
-set_weights(model, torch.tensor(weights1).reshape(-1))
+    if not test:
+        return results
+    
+    # Train and evaluate (test set) with the best hyper-parameter setting, record results. 
+    test_acc, test_loss, test_metric_dirct = objective.train_and_test(learning_rate, prior_precision, test=test)
+    results['test_acc'] = test_acc
+    results['test_loss'] = test_loss
+    results.update(test_metric_dirct)
 
+    return results # dirctionary
 
-# track test loss
-test_loss = 0.0
-loss_fn = nn.CrossEntropyLoss()
-class_correct = list(0. for i in range(10))
-class_total = list(0. for i in range(10))
+def aggregate_results(results:pd.DataFrame) -> pd.DataFrame:
 
-model.eval()
-# iterate over test data
-for data, target in test_loader:
-    # move tensors to GPU if CUDA is available
-    if use_gpu:
-        data, target = data.cuda(), target.cuda()
-    # forward pass: compute predicted outputs by passing inputs to the model
-    output = model(data)
-    # calculate the batch loss
-    loss = loss_fn(output.data, target) # nn.CrossEntropyLoss
-    # update test loss 
-    test_loss += loss.item()*data.size(0)
-    # convert output probabilities to predicted class
-    _, pred = torch.max(output, 1)    
-    # compare predictions to true label
-    correct_tensor = pred.eq(target.data.view_as(pred))
-    correct = np.squeeze(correct_tensor.numpy()) if not use_gpu else np.squeeze(correct_tensor.cpu().numpy())
-    #print(correct)
-    # calculate test accuracy for each object class
-    for i in range(len(correct)):
-        label = target.data[i]
-        class_correct[label] += correct[i].item()
-        class_total[label] += 1
+    """
+    Compute the mean and standard error of each column.
+    Args:
+        results: Un-aggregated results, of shape (n_rows, n_columns).
+    Returns:
+        Aggregated results, of shape (n_columns, 5). Columns are the mean, standard error, media, max and min, and
+        indices are the columns of the input.
+    """
+    means = results.mean()
+    standard_errors = results.sem()
+    medians = results.median()
+    maximums = results.max()
+    minimums = results.min()
 
-# average test loss
-test_loss = test_loss/len(test_loader.dataset)
+    agg_results = pd.concat([means, standard_errors, medians, maximums, minimums], axis=1)
+    agg_results.columns = ['mean', 'se', 'median', 'max', 'min']
 
-folder_path = '/home/v1xjian2/BDL/Bayesian_DL/experiments/cnn_results'
-file_name = f'results:lr:{learning_rate}_precision_{weight_prior_precision}_epoch_{n_epochs}_seed_{random_seed}'
-file_path = os.path.join(folder_path, file_name)
+    return agg_results
 
-with open(file_path, 'w') as file:
-    file.write('Test Loss: {:.6f}\n'.format(test_loss))
+@click.command()
+@click.option('--results-output-dir', type=str, help='The directory path to save the results of the experiment')
 
-    for i in range(10):
-        if class_total[i] > 0:
-            file.write('Test Accuracy of %5s: %2d%% (%2d/%2d)\n' % (
-                classes[i], 100 * class_correct[i] / class_total[i],
-                np.sum(class_correct[i]), np.sum(class_total[i])))
-        else:   
-            file.write('Test Accuracy of %5s: N/A (no training examples)\n' % (classes[i]))
-
-    file.write('\nTest Accuracy (Overall): %2d%% (%2d/%2d)\n' % (
-        100. * np.sum(class_correct) / np.sum(class_total),
-        np.sum(class_correct), np.sum(class_total)))
+def main(results_output_dir:str):
+    
+    with open('/home/v1xjian2/BDL/Bayesian_DL/cnn_params.yaml', 'r') as fd:
+        params = yaml.safe_load(fd)['resnet']
 
 
-##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### #####
+    if params['experiment_model'] == 'resnet' and params['experiment_dataset'] == 'cifar-10':
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        train_data = datasets.CIFAR10(root='/home/v1xjian2/BDL/Bayesian_DL/datasets/cifar-10', train=True,
+                                download=False, transform=transform)
+        test_data = datasets.CIFAR10(root='/home/v1xjian2/BDL/Bayesian_DL/datasets/cifar-10', train=False,
+                                download=False, transform=transform)
+
+    results, agg_results = run_experiment(
+        train_valid_dataset = train_data,  # should be train_data; datasets.CIFAR10(root='/home/v1xjian2/BDL/Bayesian_DL/datasets/cifar-10', train=True, download=False, transform=transform)
+        test_dataset = test_data,
+        latent_dim = params['latent_dim'],
+        n_gradients_per_update = params['n_gradients_per_update'],
+        max_grad_norm = params['max_grad_norm'],
+        batch_size = params['batch_size'],
+        n_epochs = params['n_epochs'],
+        learning_rate_range = params['learning_rate_range'],
+        prior_precision_range = params['prior_precision_range'],
+        n_bma_samples = params['n_bma_samples'],
+        test = params['test'],
+        n_hyperparameter_trials = params['n_hyperparameter_trials'],
+        n_train_valid_splits = params['n_train_valid_splits'],
+        valid_size = params['valid_size'],
+        random_seed = params['random_seed'],
+        device = "cuda:0" if torch.cuda.is_available() else 'cpu',
+        epochs_at_stage_1 = params['epochs_at_stage_1'],
+        increase_resistance = params['increase_resistance'],
+        log_dir = params['log_dir'],
+        threshold = params['threshold'], # 10,000 test samples in total,
+        data_split_random_seed = params["data_split_random_seed"],
+    )
+
+    Path(results_output_dir).mkdir(parents=True, exist_ok = True)
+    results.to_csv(os.path.join(results_output_dir, 'epoch: %2d threshold: %2d% results.csv' %  (params['n_epochs'], params['threshold'])))
+    agg_results.to_csv(os.path.join(results_output_dir, 'epoch: %2d threshold: %2d% results.csv aggregate_results.csv' %  (params['n_epochs'], params['threshold'])))
+
+if __name__ == '__main__':
+    main()
