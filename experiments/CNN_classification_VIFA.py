@@ -26,7 +26,6 @@ from pytorch_lightning import Trainer
 from pytorch_lightning import LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor
 from torch.optim.lr_scheduler import ExponentialLR, LambdaLR
-
 import sys
 sys.path.append('/home/v1xjian2/BDL/Bayesian_DL')
 from swafa.utils import (
