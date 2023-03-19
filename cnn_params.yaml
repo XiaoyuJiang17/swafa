@@ -1,0 +1,24 @@
+resnet:
+  experiment_model: 'resnet'
+  experiment_dataset: 'cifar-10'
+  latent_dim: 1
+  n_gradients_per_update: 12
+  max_grad_norm: 10
+  batch_size: 128
+  n_epochs: 50
+  epochs_at_stage_1: 5
+  increase_resistance: 15 # how many epoches needed to reach coefficient 0.5 at stage 2
+  learning_rate_range: [0.000001, 0.0005]
+  prior_precision_range: [0.01, 10]
+  n_bma_samples: 100 #100
+  test: true
+  n_hyperparameter_trials: 10
+  n_train_valid_splits: 5
+  data_split_random_seed: [83,31,78,4,1029]
+  valid_size: 0.2
+  random_seed: 7983
+  log_dir: '/home/v1xjian2/BDL/Bayesian_DL/pl_logs/CNN_undertest'
+  threshold: 8000 # 0f 10000 for cifar-10 dataset
+
+
+
