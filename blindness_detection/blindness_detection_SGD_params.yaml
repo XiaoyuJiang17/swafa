@@ -1,0 +1,22 @@
+resnet:
+  experiment_model: 'resnet18'
+  experiment_dataset: 'blindness'
+  data_csv_path: '/home/v1xjian2/BDL/Bayesian_DL/blindness_detection/binarised_data.csv'
+  data_image_folder: '/home/v1xjian2/BDL/Bayesian_DL/datasets/aptos2019-blindness-detection/train_images'
+  latent_dim: 1
+  n_gradients_per_update: 12
+  max_grad_norm: 10
+  batch_size: 16
+  n_epochs: 10
+  learning_rate_range: [0.000001, 0.0005]
+  prior_precision_range: [0.01, 10]
+  test: true
+  n_hyperparameter_trials: 6
+  n_data_splits: 5
+  test_size: 0.3
+  valid_size: 0.2
+  random_seed: 978
+  log_dir: '/home/v1xjian2/BDL/Bayesian_DL/pl_logs/blindness_detection/SGD'
+
+
+
