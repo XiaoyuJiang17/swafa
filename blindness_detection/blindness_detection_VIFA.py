@@ -98,42 +98,55 @@ def evaluation_function(pred_list, output_softmax_list, target_list, model_disag
     '''
     # Sort, small -> large
     pred_entropy_sorted_indices = [pred_entropy_list.index(x) for x in sorted(pred_entropy_list)]
-    model_disag_score_indices = [model_disag_score_list.index(x) for x in sorted(model_disag_score_list)]
+    model_disag_sorted_indices = [model_disag_score_list.index(x) for x in sorted(model_disag_score_list)]
 
     if 1 not in thresholds:
         thresholds += [1]
 
     metric_dirct = {}
     for threshold in thresholds:
-        index =  int(np.floor(len(pred_list) * threshold))
-        curr_accuracy = accuracy_score(target_list[:index], pred_list[:index])
-        curr_precision = precision_score(target_list[:index], pred_list[:index])
-        curr_recall = recall_score(target_list[:index], pred_list[:index])
-        curr_f1 = f1_score(target_list[:index], pred_list[:index])
-        curr_auroc = roc_auc_score(target_list[:index], output_softmax_list[:index])
-        curr_auprc = average_precision_score(target_list[:index], output_softmax_list[:index])
+        index_ =  int(np.floor(len(pred_list) * threshold))
+
+        pred_entropy_indices = pred_entropy_sorted_indices[:index_]
+        pred_entropy_target_list = [target_list[i] for i in pred_entropy_indices]
+        pred_entropy_pred_list = [pred_list[i] for i in pred_entropy_indices]
+        pred_entropy_softmax_output = [output_softmax_list[i] for i in pred_entropy_indices]
+
+        pred_entropy_curr_accuracy = accuracy_score(pred_entropy_target_list, pred_entropy_pred_list)
+        pred_entropy_curr_precision = precision_score(pred_entropy_target_list, pred_entropy_pred_list)
+        pred_entropy_curr_recall = recall_score(pred_entropy_target_list, pred_entropy_pred_list)
+        pred_entropy_curr_f1 = f1_score(pred_entropy_target_list, pred_entropy_pred_list)
+        pred_entropy_curr_auroc = roc_auc_score(pred_entropy_target_list, pred_entropy_softmax_output)
+        pred_entropy_curr_aps = average_precision_score(pred_entropy_target_list, pred_entropy_softmax_output)
+
+        model_diasg_indices = model_disag_sorted_indices[:index_]
+        model_diasg_target_list = [target_list[i] for i in model_diasg_indices]
+        model_diasg_pred_list = [pred_list[i] for i in model_diasg_indices]
+        model_diasg_softmax_output = [output_softmax_list[i] for i in model_diasg_indices]
+
+        model_diasg_curr_accuracy = accuracy_score(model_diasg_target_list, model_diasg_pred_list)
+        model_diasg_curr_precision = precision_score(model_diasg_target_list, model_diasg_pred_list)
+        model_diasg_curr_recall = recall_score(model_diasg_target_list, model_diasg_pred_list)
+        model_diasg_curr_f1 = f1_score(model_diasg_target_list, model_diasg_pred_list)
+        model_diasg_curr_auroc = roc_auc_score(model_diasg_target_list, model_diasg_softmax_output)
+        model_diasg_curr_aps = average_precision_score(model_diasg_target_list, model_diasg_softmax_output)
 
         jj = int(np.floor(threshold * 100))
-        exec(f'metric_dirct["accuracy_{jj}"] = round(curr_accuracy,3)')
-        exec(f'metric_dirct["precision_{jj}"] = round(curr_precision,3)')
-        exec(f'metric_dirct["recall_{jj}"] = round(curr_recall,3)')
-        exec(f'metric_dirct["f1_{jj}"] = round(curr_f1,3)')
-        exec(f'metric_dirct["auroc_{jj}"] = round(curr_auroc,3)')
-        exec(f'metric_dirct["auprc_{jj}"] = round(curr_auprc,3)')
+        exec(f'metric_dirct["pred_entropy_accuracy_{jj}"] = round(pred_entropy_curr_accuracy,3)')
+        exec(f'metric_dirct["pred_entropy_precision_{jj}"] = round(pred_entropy_curr_precision,3)')
+        exec(f'metric_dirct["pred_entropy_recall_{jj}"] = round(pred_entropy_curr_recall,3)')
+        exec(f'metric_dirct["pred_entropy_f1_{jj}"] = round(pred_entropy_curr_f1,3)')
+        exec(f'metric_dirct["pred_entropy_auroc_{jj}"] = round(pred_entropy_curr_auroc,3)')
+        exec(f'metric_dirct["pred_entropy_aps_{jj}"] = round(pred_entropy_curr_aps,3)')
+
+        exec(f'metric_dirct["model_diasg_accuracy_{jj}"] = round(model_diasg_curr_accuracy,3)')
+        exec(f'metric_dirct["model_diasg_precision_{jj}"] = round(model_diasg_curr_precision,3)')
+        exec(f'metric_dirct["model_diasg_recall_{jj}"] = round(model_diasg_curr_recall,3)')
+        exec(f'metric_dirct["model_diasg_f1_{jj}"] = round(model_diasg_curr_f1,3)')
+        exec(f'metric_dirct["model_diasg_auroc_{jj}"] = round(model_diasg_curr_auroc,3)')
+        exec(f'metric_dirct["model_diasg_aps_{jj}"] = round(model_diasg_curr_aps,3)')
 
     return metric_dirct
-
-
-def delete_and_clear(list):
-
-    try:
-        for item in list:
-            item = None
-
-    except Exception: # pass all the errors
-        pass
-
-    torch.cuda.empty_cache()
 
 class RetinopathyDataset(Dataset):
 
@@ -440,8 +453,13 @@ class FactorAnalysisVariationalInferenceCallback(Callback):
         self._prior_grad_wrt_F = None
         self._prior_grad_wrt_log_diag_psi = None
 
-        self._optimiser = None
-        self._scheduler = None
+        self._optimiser_c = None
+        self._scheduler_c = None
+        self._optimiser_F = None
+        self._scheduler_F = None
+        self._optimiser_log_diag_psi = None
+        self._scheduler_log_diag_psi = None
+
         self._batch_counter = 0
         self._epoch_counter = 0
 
@@ -997,11 +1015,8 @@ class Objective:
 
         metric_dirct = evaluation_function(pred_list=pred_list, output_softmax_list=output_softmax_list, target_list=target_list, \
                         model_disag_score_list=model_disag_score_list, pred_entropy_list=pred_entropy_list, thresholds=self.threshold)      
-        
-        
-        delete_and_clear([model, callbacks, pred_list, output_softmax_list, target_list, model_disag_score_list, pred_entropy_list])
 
-        return round(float(metric_dirct['accuracy_100']), 3), round(float(test_loss), 3), metric_dirct
+        return round(float(metric_dirct['pred_entropy_accuracy_100']), 3), round(float(test_loss), 3), metric_dirct
 
 
 def run_experiment(
@@ -1189,11 +1204,11 @@ def aggregate_results(results:pd.DataFrame) -> pd.DataFrame:
         Aggregated results, of shape (n_columns, 5). Columns are the mean, standard error, media, max and min, and
         indices are the columns of the input.
     """
-    means = results.mean()
-    standard_errors = results.sem()
-    medians = results.median()
-    maximums = results.max()
-    minimums = results.min()
+    means = round(results.mean(),3)
+    standard_errors = round(results.sem(),3)
+    medians = round(results.median(),3)
+    maximums = round(results.max(),3)
+    minimums = round(results.min(),3)
 
     agg_results = pd.concat([means, standard_errors, medians, maximums, minimums], axis=1)
     agg_results.columns = ['mean', 'se', 'median', 'max', 'min']
